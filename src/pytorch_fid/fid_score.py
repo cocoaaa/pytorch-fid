@@ -272,6 +272,41 @@ def compute_statistics_of_path(
     return mu, cov
 
 
+def save_activation_statistics(*,
+        dataset: Dataset,
+        model: nn.Module,
+        batch_size: int=50,
+        dims: int=2048,
+        device: Union[torch.device, str]='cpu',
+        num_workers: int=1,
+        out_fp: Path,
+) -> None: #Tuple[np.ndarray, np.ndarray]:
+    """Calculation of the statistics used by the FID and save to `out_fp` using np.savez.
+    Params:
+    -- dataset     : Dataset object for generated sample set
+    -- model       : Instance of inception model
+    -- batch_size  : The images numpy array is split into batches with
+                     batch size batch_size. A reasonable batch size
+                     depends on the hardware.
+    -- dims        : Dimensionality of features returned by Inception
+    -- device      : Device to run calculations
+    -- num_workers : Number of parallel dataloader workers
+
+    Returns:
+    -- mu    : The mean over samples of the activations of the pool_3 layer of
+               the inception model.
+    -- sigma : The covariance matrix of the activations of the pool_3 layer of
+               the inception model.
+    """
+    act = get_activations(dataset, model, batch_size, dims, device, num_workers)
+    mu = np.mean(act, axis=0)
+    cov = np.cov(act, rowvar=False)
+    with out_fp.open('wb') as f:
+        np.savez(f, mu=mu, cov=cov)
+        print("Saved (mu,cov) of features of the input dataset: ", out_fp)
+    # return mu, cov
+
+
 def load_precomputed_stats(
         precomputed_stats_fp:  Union[Path,str],
         device: Union[torch.device, str],
