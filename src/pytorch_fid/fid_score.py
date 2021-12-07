@@ -301,7 +301,7 @@ def save_activation_statistics(*,
     act = get_activations(dataset, model, batch_size, dims, device, num_workers)
     mu = np.mean(act, axis=0)
     cov = np.cov(act, rowvar=False)
-    with out_fp.open('wb') as f:
+    with open(out_fp, 'wb') as f:
         np.savez(f, mu=mu, cov=cov)
         print("Saved (mu,cov) of features of the input dataset: ", out_fp)
     # return mu, cov
