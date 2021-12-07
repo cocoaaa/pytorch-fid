@@ -138,7 +138,7 @@ def get_activations(
     start_idx = 0
 
     for batch in tqdm(dataloader):
-        batch = batch.to(device)
+        batch = batch['x'].to(device) # dataset.unpack(batch)[0]
 
         with torch.no_grad():
             pred = model(batch)[0]
