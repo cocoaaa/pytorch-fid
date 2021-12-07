@@ -32,15 +32,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import os
-import pathlib
+from pathlib import Path
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from typing import Union, List, Tuple, Iterable
 
 import numpy as np
 import torch
+from torch import Tensor
+from torch import nn
+from torch.nn.functional import adaptive_avg_pool2d
+from torch.utils.data import Dataset, TensorDataset
 import torchvision.transforms as TF
 from PIL import Image
 from scipy import linalg
-from torch.nn.functional import adaptive_avg_pool2d
 
 try:
     from tqdm import tqdm
@@ -63,12 +67,14 @@ parser.add_argument('--dims', type=int, default=2048,
                     choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
                     help=('Dimensionality of Inception features to use. '
                           'By default, uses pool3 features'))
-parser.add_argument('path', type=str, nargs=2,
-                    help=('Paths to the generated images or '
-                          'to .npz statistic files'))
+parser.add_argument('--sample_path', type=str,
+                    help='Path to the generated images saved by `torch.save`')
+parser.add_argument('--precomputed_real_path', type=str,
+                    help='Path to .npz file that `mu` and `cov` precomputed on real dataset')
 
 IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}
+SERIALIZED_SUFFICES = ['.npz', '.pkl']
 
 
 class ImagePathDataset(torch.utils.data.Dataset):
@@ -87,12 +93,18 @@ class ImagePathDataset(torch.utils.data.Dataset):
         return img
 
 
-def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
-                    num_workers=1):
+def get_activations(
+        dataset: Dataset,
+        model: nn.Module,
+        batch_size: int=50,
+        dims: int=2048,
+        device: Union[torch.device, str]='cpu',
+        num_workers: int=1
+) -> np.ndarray:
     """Calculates the activations of the pool_3 layer for all images.
 
     Params:
-    -- files       : List of image files paths
+    -- dataset     : Dataset object for generated sample set
     -- model       : Instance of inception model
     -- batch_size  : Batch size of images for the model to process at once.
                      Make sure that the number of samples is a multiple of
@@ -106,23 +118,22 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
     Returns:
     -- A numpy array of dimension (num images, dims) that contains the
        activations of the given tensor when feeding inception with the
-       query tensor.
+       query tensor in device 'cpu'
     """
     model.eval()
 
-    if batch_size > len(files):
+    if batch_size > len(dataset):
         print(('Warning: batch size is bigger than the data size. '
                'Setting batch size to data size'))
-        batch_size = len(files)
+        batch_size = len(dataset)
 
-    dataset = ImagePathDataset(files, transforms=TF.ToTensor())
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=False,
                                              drop_last=False,
                                              num_workers=num_workers)
 
-    pred_arr = np.empty((len(files), dims))
+    pred_arr = np.empty((len(dataset), dims))
 
     start_idx = 0
 
@@ -146,7 +157,13 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
     return pred_arr
 
 
-def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+def calculate_frechet_distance(
+        mu1,
+        sigma1,
+        mu2,
+        sigma2,
+        eps=1e-6
+) -> float:
     """Numpy implementation of the Frechet Distance.
     The Frechet distance between two multivariate Gaussians X_1 ~ N(mu_1, C_1)
     and X_2 ~ N(mu_2, C_2) is
@@ -167,7 +184,6 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
     Returns:
     --   : The Frechet Distance.
     """
-
     mu1 = np.atleast_1d(mu1)
     mu2 = np.atleast_1d(mu2)
 
@@ -203,11 +219,17 @@ def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
             + np.trace(sigma2) - 2 * tr_covmean)
 
 
-def calculate_activation_statistics(files, model, batch_size=50, dims=2048,
-                                    device='cpu', num_workers=1):
+def calculate_activation_statistics(
+        dataset: Dataset,
+        model: nn.Module,
+        batch_size: int=50,
+        dims: int=2048,
+        device: Union[torch.device, str]='cpu',
+        num_workers: int=1
+) -> Tuple[np.ndarray, np.ndarray]:
     """Calculation of the statistics used by the FID.
     Params:
-    -- files       : List of image files paths
+    -- dataset     : Dataset object for generated sample set
     -- model       : Instance of inception model
     -- batch_size  : The images numpy array is split into batches with
                      batch size batch_size. A reasonable batch size
@@ -222,42 +244,61 @@ def calculate_activation_statistics(files, model, batch_size=50, dims=2048,
     -- sigma : The covariance matrix of the activations of the pool_3 layer of
                the inception model.
     """
-    act = get_activations(files, model, batch_size, dims, device, num_workers)
+    act = get_activations(dataset, model, batch_size, dims, device, num_workers)
     mu = np.mean(act, axis=0)
-    sigma = np.cov(act, rowvar=False)
-    return mu, sigma
+    cov = np.cov(act, rowvar=False)
+    return mu, cov
 
 
-def compute_statistics_of_path(path, model, batch_size, dims, device,
-                               num_workers=1):
-    if path.endswith('.npz'):
-        with np.load(path) as f:
-            m, s = f['mu'][:], f['sigma'][:]
-    else:
-        path = pathlib.Path(path)
-        files = sorted([file for ext in IMAGE_EXTENSIONS
-                       for file in path.glob('*.{}'.format(ext))])
-        m, s = calculate_activation_statistics(files, model, batch_size,
-                                               dims, device, num_workers)
+def compute_statistics_of_path(
+        path: Path,
+        model: nn.Module,
+        batch_size: int,
+        dims: int,
+        device: Union[torch.device, str],
+       num_workers=1,
+) -> Tuple[np.ndarray,np.ndarray]:
+    """Given the generated sample set in `path` (eg. `dcgan_samples.pkl` saved by `torch.save`),
+    load the sample set as TensorDataset, use `model` to embed each image in the sample set into
+    the embedding (e.g. 2048-long vector), and compute the mean and covariance of the embeddings
 
-    return m, s
+    """
+    if not path.suffix in SERIALIZED_SUFFICES:
+        raise IOError('Input file must have a suffix in one of ',  SERIALIZED_SUFFICES)
+
+    x_gen = torch.load(path) # (n_samples, nc, h, w) tensor in cuda
+    dset = TensorDataset(x_gen)
+    mu, cov = calculate_activation_statistics(dset, model, batch_size, dims, device, num_workers) #m and s are np.array of shape (dims,) and (dims,dims), respectively
+    return mu, cov
 
 
-def calculate_fid_given_paths(paths, batch_size, device, dims, num_workers=1):
-    """Calculates the FID of two paths"""
-    for p in paths:
-        if not os.path.exists(p):
-            raise RuntimeError('Invalid path: %s' % p)
+def load_precomputed_stats(
+        precomputed_stats_fp:  Union[Path,str],
+        device: Union[torch.device, str],
+ )-> Tuple[np.ndarray, np.ndarray]:
+    with np.load(precomputed_stats_fp) as f:
+        m, s = f['mu'][:], f['cov'][:]
+    return m,s
+
+
+def calculate_fid_given_paths(
+        sample_fp: Path,
+        precomputed_stats_fp: Union[Path,str],
+        batch_size: int,
+        device: Union[torch.device,str],
+        dims: int,
+        num_workers=1
+) -> float:
+    """Calculates the FID of two multivariate guassians, estimated from genereated sample set and real dataset"""
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
 
     model = InceptionV3([block_idx]).to(device)
 
-    m1, s1 = compute_statistics_of_path(paths[0], model, batch_size,
-                                        dims, device, num_workers)
-    m2, s2 = compute_statistics_of_path(paths[1], model, batch_size,
-                                        dims, device, num_workers)
-    fid_value = calculate_frechet_distance(m1, s1, m2, s2)
+    mu_gen, cov_gen = compute_statistics_of_path(sample_fp, model, batch_size,
+                                                 dims, device, num_workers)
+    mu_real, cov_real = load_precomputed_stats(precomputed_stats_fp, device)
+    fid_value = calculate_frechet_distance(mu_gen, cov_gen, mu_real, cov_real)
 
     return fid_value
 
@@ -276,11 +317,14 @@ def main():
     else:
         num_workers = args.num_workers
 
-    fid_value = calculate_fid_given_paths(args.path,
-                                          args.batch_size,
-                                          device,
-                                          args.dims,
-                                          num_workers)
+    fid_value = calculate_fid_given_paths(
+        Path(args.sample_path),
+        Path(args.precomputed_real_path),
+        args.batch_size,
+        device,
+        args.dims,
+        num_workers
+    )
     print('FID: ', fid_value)
 
 
